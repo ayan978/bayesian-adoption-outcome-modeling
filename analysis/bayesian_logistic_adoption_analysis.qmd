@@ -584,4 +584,296 @@ kable(
 )
 ```
 
-The convergence diagnostics suggest that the MCMC sampling was acceptable for this analysis. The maximum $\hat{R}$ value was 1.001, which is very close to 1 and indicates good agreement between chains. The minimum effective sample size was 670, suggesting that the retained posterior draws provide enough independent information for stable posterior summaries. Trace plots are examined next as a visual diagnostic.
+The convergence diagnostics suggest that the MCMC sampling was acceptable for this analysis. The maximum $\hat{R}$ value was 1.001, which is very close to 1 and indicates good agreement between chains. The minimum effective sample size was 670, suggesting that the retained posterior draws provide enough independent information for stable posterior summaries. Trace plots are examined next as a visual diagnostic.\
+
+### MCMC Trace Plots
+
+```{r}
+#| label: mcmc-trace-plot
+#| fig-cap: "Trace plots for selected posterior coefficients."
+
+coefficient_lookup <- tibble(
+  parameter = paste0("beta[", seq_along(colnames(X)), "]"),
+  term = colnames(X)
+) %>%
+  mutate(
+    label = case_when(
+      term == "(Intercept)" ~ "Intercept",
+      term == "sexNeutered" ~ "Sex/status: Neutered",
+      term == "sexSpayed" ~ "Sex/status: Spayed",
+      term == "intake_typereturn" ~ "Intake: Return",
+      term == "age_scaled" ~ "Age at intake",
+      TRUE ~ term
+    )
+  )
+
+selected_trace_terms <- c(
+  "(Intercept)",
+  "sexNeutered",
+  "sexSpayed",
+  "intake_typereturn",
+  "age_scaled"
+)
+
+selected_trace_params <- coefficient_lookup %>%
+  filter(term %in% selected_trace_terms)
+
+trace_data <- map_dfr(seq_along(posterior_samples), function(chain_id) {
+  chain_matrix <- as.matrix(posterior_samples[[chain_id]])
+
+  as_tibble(chain_matrix, .name_repair = "minimal") %>%
+    mutate(
+      iteration = row_number(),
+      chain = paste("Chain", chain_id)
+    ) %>%
+    select(iteration, chain, all_of(selected_trace_params$parameter)) %>%
+    pivot_longer(
+      cols = all_of(selected_trace_params$parameter),
+      names_to = "parameter",
+      values_to = "posterior_draw"
+    )
+}) %>%
+  left_join(selected_trace_params, by = "parameter") %>%
+  mutate(
+    label = factor(
+      label,
+      levels = c(
+        "Intercept",
+        "Sex/status: Neutered",
+        "Sex/status: Spayed",
+        "Intake: Return",
+        "Age at intake"
+      )
+    )
+  )
+
+mcmc_trace_plot <- ggplot(
+  trace_data,
+  aes(x = iteration, y = posterior_draw, colour = chain)
+) +
+  geom_line(alpha = 0.6, linewidth = 0.25) +
+  facet_wrap(~ label, scales = "free_y", ncol = 1) +
+  labs(
+    title = "MCMC trace plots for selected coefficients",
+    x = "Iteration",
+    y = "Posterior draw"
+  )
+
+mcmc_trace_plot
+
+ggsave(
+  filename = file.path(figures_dir, "mcmc_trace_selected_coefficients.png"),
+  plot = mcmc_trace_plot,
+  width = 8,
+  height = 7,
+  dpi = 300
+)
+```
+
+The trace plots show stable sampling behaviour for the selected coefficients, with no clear long-term trends or systematic drift across iterations. Combined with the low maximum $\hat{R}$ value and acceptable effective sample size, these plots support the use of the posterior samples for coefficient interpretation and prediction.\
+
+### Posterior Coefficient Effects
+
+The posterior coefficient estimates are shown on the log-odds scale. Positive values indicate higher adoption log-odds relative to the reference category, while negative values indicate lower adoption log-odds. The reference categories are cat, female, normal intake condition, and stray intake type.
+
+```{r}
+#| label: posterior-coefficient-effects
+#| fig-cap: "Posterior means and 95% credible intervals for Bayesian logistic regression coefficients."
+#| fig-width: 8
+#| fig-height: 7.5
+#| out-width: "100%"
+
+posterior_coef_summary <- tibble(
+  parameter = colnames(posterior_matrix),
+  mean = colMeans(posterior_matrix),
+  lower = apply(posterior_matrix, 2, quantile, probs = 0.025),
+  upper = apply(posterior_matrix, 2, quantile, probs = 0.975)
+) %>%
+  mutate(
+    coefficient_index = as.integer(str_extract(parameter, "\\d+")),
+    term = colnames(X)[coefficient_index],
+    label = case_when(
+      term == "(Intercept)" ~ "Intercept",
+      term == "animal_typedog" ~ "Animal: Dog",
+      term == "animal_typeguinea pig" ~ "Animal: Guinea pig",
+      term == "animal_typerabbit" ~ "Animal: Rabbit",
+      term == "animal_typereptile" ~ "Animal: Reptile",
+      term == "sexMale" ~ "Sex/status: Male",
+      term == "sexNeutered" ~ "Sex/status: Neutered",
+      term == "sexSpayed" ~ "Sex/status: Spayed",
+      term == "sexUnknown" ~ "Sex/status: Unknown",
+      term == "intake_conditionferal" ~ "Condition: Feral",
+      term == "intake_conditionfractious" ~ "Condition: Fractious",
+      term == "intake_conditionill mild" ~ "Condition: Ill mild",
+      term == "intake_conditionill moderate" ~ "Condition: Ill moderate",
+      term == "intake_conditionill severe" ~ "Condition: Ill severe",
+      term == "intake_conditioninjured mild" ~ "Condition: Injured mild",
+      term == "intake_conditioninjured moderate" ~ "Condition: Injured moderate",
+      term == "intake_conditioninjured severe" ~ "Condition: Injured severe",
+      term == "intake_conditionother" ~ "Condition: Other",
+      term == "intake_conditionunder age/weight" ~ "Condition: Under age/weight",
+      term == "intake_typeconfiscate" ~ "Intake: Confiscate",
+      term == "intake_typeother" ~ "Intake: Other",
+      term == "intake_typeowner surrender" ~ "Intake: Owner surrender",
+      term == "intake_typereturn" ~ "Intake: Return",
+      term == "intake_typewelfare seized" ~ "Intake: Welfare seized",
+      term == "age_scaled" ~ "Age at intake",
+      TRUE ~ term
+    )
+  )
+
+write_csv(
+  posterior_coef_summary,
+  file.path(tables_dir, "posterior_coefficient_summary.csv")
+)
+
+posterior_effects_plot <- posterior_coef_summary %>%
+  filter(term != "(Intercept)") %>%
+  ggplot(aes(x = mean, y = reorder(label, mean))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_errorbar(
+    aes(xmin = lower, xmax = upper),
+    orientation = "y",
+    width = 0.2
+  ) +
+  geom_point(size = 2) +
+  labs(
+    title = "Posterior effects on adoption log-odds",
+    x = "Posterior mean and 95% credible interval",
+    y = "Coefficient"
+  )
+
+posterior_effects_plot
+
+ggsave(
+  filename = file.path(figures_dir, "posterior_effects_on_adoption_log_odds.png"),
+  plot = posterior_effects_plot,
+  width = 8,
+  height = 7.5,
+  dpi = 300
+)
+```
+
+The posterior effects show that recorded spayed and neutered status are strongly associated with higher adoption log-odds relative to the female reference category. Guinea pigs, reptiles, dogs, and return intake records also have positive posterior effects, although some of these categories have wider credible intervals. Older age at intake is associated with lower adoption log-odds. Records with unknown sex/status, feral or fractious intake condition, and other intake type show clearly negative posterior effects. Coefficients whose 95% credible intervals cross zero should be interpreted more cautiously because the posterior evidence for a directional association is weaker.\
+
+## Predicted Adoption Probabilities
+
+Posterior coefficients are on the log-odds scale, so selected model-based predictions are used to express results as adoption probabilities. The profiles below compare animal types and recorded sex/status while holding intake condition as normal, intake type as stray, and age at the median value.
+
+```{r}
+#| label: predicted-adoption-probabilities
+#| fig-cap: "Posterior predicted adoption probabilities for selected animal profiles."
+#| fig-width: 8
+#| fig-height: 5
+#| out-width: "100%"
+
+age_mean <- mean(model_data$age_years)
+age_sd <- sd(model_data$age_years)
+median_age <- median(model_data$age_years)
+
+prediction_profiles <- expand_grid(
+  animal_type = c("cat", "dog", "rabbit", "guinea pig", "reptile"),
+  sex = c("Female", "Spayed")
+) %>%
+  mutate(
+    intake_condition = "normal",
+    intake_type = "stray",
+    age_years = median_age,
+    age_scaled = (age_years - age_mean) / age_sd,
+    animal_type = factor(animal_type, levels = levels(model_data$animal_type)),
+    sex = factor(sex, levels = levels(model_data$sex)),
+    intake_condition = factor(intake_condition, levels = levels(model_data$intake_condition)),
+    intake_type = factor(intake_type, levels = levels(model_data$intake_type))
+  )
+
+profile_matrix <- model.matrix(
+  ~ animal_type + sex + intake_condition + intake_type + age_scaled,
+  data = prediction_profiles
+)
+
+missing_columns <- setdiff(colnames(X), colnames(profile_matrix))
+
+if (length(missing_columns) > 0) {
+  missing_matrix <- matrix(
+    0,
+    nrow = nrow(profile_matrix),
+    ncol = length(missing_columns)
+  )
+  colnames(missing_matrix) <- missing_columns
+  profile_matrix <- cbind(profile_matrix, missing_matrix)
+}
+
+profile_matrix <- profile_matrix[, colnames(X), drop = FALSE]
+
+beta_draws <- posterior_matrix[, paste0("beta[", seq_len(ncol(X)), "]"), drop = FALSE]
+
+predicted_probability_draws <- plogis(beta_draws %*% t(profile_matrix))
+
+prediction_intervals <- map_dfr(
+  seq_len(ncol(predicted_probability_draws)),
+  function(profile_id) {
+    draws <- predicted_probability_draws[, profile_id]
+
+    tibble(
+      mean = mean(draws),
+      lower = quantile(draws, 0.025),
+      upper = quantile(draws, 0.975)
+    )
+  }
+)
+
+prediction_summary <- bind_cols(
+  prediction_profiles,
+  prediction_intervals
+) %>%
+  mutate(
+    profile = paste(str_to_title(animal_type), "|", sex),
+    profile = factor(profile, levels = profile[order(mean)])
+  )
+
+write_csv(
+  prediction_summary,
+  file.path(tables_dir, "predicted_adoption_probability_profiles.csv")
+)
+
+predicted_probability_plot <- ggplot(
+  prediction_summary,
+  aes(x = mean, y = profile)
+) +
+  geom_errorbar(
+    aes(xmin = lower, xmax = upper),
+    orientation = "y",
+    width = 0.18
+  ) +
+  geom_point(size = 2) +
+  scale_x_continuous(
+    labels = percent,
+    limits = c(0, 1)
+  ) +
+  labs(
+    title = "Predicted adoption probability for selected profiles",
+    subtitle = "Normal intake condition, stray intake type, median age",
+    x = "Predicted adoption probability",
+    y = "Animal profile"
+  )
+
+predicted_probability_plot
+
+ggsave(
+  filename = file.path(figures_dir, "predicted_adoption_probability_profiles.png"),
+  plot = predicted_probability_plot,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+The predicted probabilities show that recorded spayed status is associated with substantially higher model-estimated adoption probability across animal types. Cats and dogs have relatively low predicted adoption probabilities when recorded as female only, but much higher probabilities when recorded as spayed. Guinea pigs and reptiles also show high predicted probabilities when recorded as spayed, although their intervals are wider, indicating greater posterior uncertainty. These predictions are conditional on normal intake condition, stray intake type, and median age.\
+
+## Conclusion
+
+This project used Bayesian logistic regression to estimate how animal and intake characteristics are associated with adoption outcomes in Long Beach Animal Shelter records. The model suggests that recorded sex/status, animal type, intake type, intake condition, and age at intake are all relevant to adoption probability.
+
+The strongest positive associations were observed for records marked as spayed or neutered, while older age, unknown sex/status, feral or fractious intake condition, and other intake type were associated with lower adoption log-odds. Model-based predicted probabilities also showed that the same animal type can have substantially different adoption probabilities depending on recorded sex/status.
+
+These results should be interpreted as associations rather than causal effects. In practice, the analysis can help identify groups of shelter records with lower model-estimated adoption probability, which may support more targeted outreach, resource planning, and adoption support strategies.
