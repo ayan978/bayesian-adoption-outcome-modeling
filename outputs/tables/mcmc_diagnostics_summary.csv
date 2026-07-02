@@ -1,0 +1,5 @@
+Metric,Value
+Number of MCMC chains,2
+Total retained posterior draws,"8,000"
+Maximum Rhat,1.001
+Minimum effective sample size,670

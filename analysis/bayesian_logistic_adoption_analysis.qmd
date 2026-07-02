@@ -43,10 +43,545 @@ data_raw_path <- "../data/raw/longbeach.csv"
 data_processed_dir <- "../data/processed"
 figures_dir <- "../outputs/figures"
 tables_dir <- "../outputs/tables"
+model_dir <- "../outputs/model"
 
 dir.create(data_processed_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(figures_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(model_dir, recursive = TRUE, showWarnings = FALSE)
 
 theme_set(theme_minimal(base_size = 12))
 ```
+
+## Data Source and Initial Structure
+
+The analysis uses shelter intake and outcome records from Long Beach Animal Shelter. The dataset contains information on animal characteristics, intake details, and recorded shelter outcomes.
+
+```{r}
+#| label: import-data
+
+longbeach_raw <- read_csv(data_raw_path, show_col_types = FALSE)
+```
+
+```{r}
+#| label: raw-data-overview
+
+raw_data_overview <- tibble(
+  Metric = c(
+    "Number of records",
+    "Number of columns",
+    "Unique animal IDs",
+    "Additional records from repeated animal IDs",
+    "Exact duplicate rows"
+  ),
+  Value = comma(c(
+    nrow(longbeach_raw),
+    ncol(longbeach_raw),
+    n_distinct(longbeach_raw$animal_id),
+    nrow(longbeach_raw) - n_distinct(longbeach_raw$animal_id),
+    sum(duplicated(longbeach_raw))
+  ))
+)
+
+kable(raw_data_overview, caption = "Initial structure of the raw Long Beach Animal Shelter dataset")
+```
+
+The raw dataset contains shelter-level intake and outcome records. Because some `animal_id` values appear more than once, the rows are treated as shelter records rather than guaranteed unique animals throughout the analysis.
+
+## Data Cleaning and Outcome Definition
+
+The response variable is defined as whether a shelter record resulted in adoption. Records with missing outcome type are removed because the adoption outcome is not observed. The analysis is restricted to common adoptable pet types so that the model focuses on a practical shelter adoption setting rather than combining very different animal categories.
+
+```{r}
+#| label: clean-data
+
+model_data <- longbeach_raw %>%
+  mutate(
+    animal_type = str_to_lower(str_squish(animal_type)),
+    intake_condition = str_to_lower(str_squish(intake_condition)),
+    intake_type = str_to_lower(str_squish(intake_type)),
+    outcome_type = str_to_lower(str_squish(outcome_type)),
+    sex = str_squish(sex),
+    dob = as_date(dob),
+    intake_date = as_date(intake_date),
+    age_years = as.numeric(intake_date - dob) / 365.25,
+    adopted = case_when(
+      outcome_type == "adoption" ~ 1L,
+      !is.na(outcome_type) ~ 0L,
+      TRUE ~ NA_integer_
+    ),
+    intake_condition = if_else(
+      intake_condition == "ill moderatete",
+      "ill moderate",
+      intake_condition
+    )
+  ) %>%
+  filter(
+    animal_type %in% c("cat", "dog", "rabbit", "guinea pig", "reptile"),
+    !is.na(adopted),
+    !is.na(age_years),
+    age_years >= 0
+  ) %>%
+  mutate(
+    intake_type = case_when(
+      intake_type %in% c("stray", "owner surrender", "return", "welfare seized", "confiscate") ~ intake_type,
+      TRUE ~ "other"
+    ),
+    intake_condition = case_when(
+      intake_condition %in% c(
+        "normal",
+        "under age/weight",
+        "ill mild",
+        "ill moderate",
+        "ill severe",
+        "injured mild",
+        "injured moderate",
+        "injured severe",
+        "fractious",
+        "feral"
+      ) ~ intake_condition,
+      TRUE ~ "other"
+    )
+  ) %>%
+  select(
+    adopted,
+    animal_type,
+    sex,
+    intake_condition,
+    intake_type,
+    age_years
+  )
+
+write_csv(model_data, file.path(data_processed_dir, "model_data.csv"))
+```
+
+```{r}
+#| label: cleaning-summary
+
+cleaning_summary <- tibble(
+  Metric = c(
+    "Raw records",
+    "Clean modelling records",
+    "Adopted records",
+    "Non-adoption records",
+    "Adoption rate"
+  ),
+  Value = c(
+    comma(nrow(longbeach_raw)),
+    comma(nrow(model_data)),
+    comma(sum(model_data$adopted == 1)),
+    comma(sum(model_data$adopted == 0)),
+    percent(mean(model_data$adopted), accuracy = 0.1)
+  )
+)
+
+kable(cleaning_summary, caption = "Summary of cleaned modelling dataset")
+```
+
+After cleaning, the modelling dataset contains the records used for both exploratory analysis and Bayesian logistic regression. The binary response distinguishes adoption from all other observed shelter outcomes, so the results should be interpreted as associations with recorded adoption rather than with overall animal welfare success.
+
+## Exploratory Analysis
+
+Before fitting the Bayesian logistic regression model, the cleaned data were explored to understand the adoption outcome distribution and how adoption rates vary across key animal and intake characteristics.
+
+### Adoption Outcome Distribution
+
+```{r}
+#| label: adoption-outcome-distribution
+#| fig-cap: "Distribution of adoption and non-adoption records in the cleaned modelling dataset."
+
+outcome_distribution <- model_data %>%
+  count(adopted) %>%
+  mutate(
+    outcome = if_else(adopted == 1, "Adopted", "Not adopted"),
+    proportion = n / sum(n),
+    label = paste0(comma(n), " (", percent(proportion, accuracy = 0.1), ")")
+  )
+
+outcome_distribution_plot <- ggplot(outcome_distribution, aes(x = outcome, y = n)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = label), vjust = -0.4, size = 3.5) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Adoption outcome distribution",
+    x = "Recorded outcome",
+    y = "Number of records"
+  )
+
+outcome_distribution_plot
+
+ggsave(
+  filename = file.path(figures_dir, "adoption_outcome_distribution.png"),
+  plot = outcome_distribution_plot,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+The cleaned modelling dataset contains 6,106 adoption records and 17,532 non-adoption records, corresponding to an adoption rate of 25.8%. This confirms that adoption is the minority outcome in the cleaned data. As a result, the Bayesian model estimates adoption probability relative to a larger baseline group of other observed shelter outcomes.
+
+### Observed Adoption Rate by Animal Type
+
+```{r}
+#| label: adoption-rate-by-animal-type
+#| fig-cap: "Observed adoption rate by animal type."
+
+adoption_by_animal_type <- model_data %>%
+  group_by(animal_type) %>%
+  summarise(
+    records = n(),
+    adopted_records = sum(adopted == 1),
+    adoption_rate = mean(adopted),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    animal_type = str_to_title(animal_type),
+    label = percent(adoption_rate, accuracy = 0.1)
+  ) %>%
+  arrange(adoption_rate)
+
+adoption_by_animal_type_plot <- ggplot(
+  adoption_by_animal_type,
+  aes(x = adoption_rate, y = reorder(animal_type, adoption_rate))
+) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = label), hjust = -0.15, size = 3.5) +
+  scale_x_continuous(
+    labels = percent,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Observed adoption rate by animal type",
+    x = "Observed adoption rate",
+    y = "Animal type"
+  )
+
+adoption_by_animal_type_plot
+
+ggsave(
+  filename = file.path(figures_dir, "observed_adoption_rate_by_animal_type.png"),
+  plot = adoption_by_animal_type_plot,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+Observed adoption rates vary across animal types. Rabbits have the highest observed adoption rate at 31.7%, followed by guinea pigs at 29.8%, dogs at 26.8%, and cats at 25.2%. Reptiles have a much lower observed adoption rate at 3.1%. These are unadjusted rates, so they describe raw differences by animal type before controlling for other characteristics such as age, intake condition, intake type, and recorded sex/status.
+
+### Observed Adoption Rate by Age Group
+
+```{r}
+#| label: adoption-rate-by-age-group
+#| fig-cap: "Observed adoption rate by age group."
+
+age_group_data <- model_data %>%
+  mutate(
+    age_group = case_when(
+      age_years < 1 ~ "Under 1 year",
+      age_years < 3 ~ "1 to under 3 years",
+      age_years < 7 ~ "3 to under 7 years",
+      TRUE ~ "7 years and older"
+    ),
+    age_group = factor(
+      age_group,
+      levels = c(
+        "Under 1 year",
+        "1 to under 3 years",
+        "3 to under 7 years",
+        "7 years and older"
+      )
+    )
+  ) %>%
+  group_by(age_group) %>%
+  summarise(
+    records = n(),
+    adopted_records = sum(adopted == 1),
+    adoption_rate = mean(adopted),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = percent(adoption_rate, accuracy = 0.1)
+  )
+
+adoption_by_age_group_plot <- ggplot(
+  age_group_data,
+  aes(x = age_group, y = adoption_rate)
+) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = label), vjust = -0.35, size = 3.5) +
+  scale_y_continuous(
+    labels = percent,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Observed adoption rate by age group",
+    x = "Age at intake",
+    y = "Observed adoption rate"
+  )
+
+adoption_by_age_group_plot
+
+ggsave(
+  filename = file.path(figures_dir, "observed_adoption_rate_by_age_group.png"),
+  plot = adoption_by_age_group_plot,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+Observed adoption rates decline for older animals. Records for animals under 3 years old have adoption rates around 28%, while records for animals aged 7 years and older have a lower observed adoption rate of 17.3%. This suggests age may be an important predictor in the Bayesian logistic regression model, although these are still unadjusted rates and do not control for animal type, intake condition, intake type, or recorded sex/status.\
+
+### Observed Adoption Rate by Recorded Sex/Status
+
+```{r}
+#| label: adoption-rate-by-sex-status
+#| fig-cap: "Observed adoption rate by recorded sex/status."
+
+adoption_by_sex_status <- model_data %>%
+  group_by(sex) %>%
+  summarise(
+    records = n(),
+    adopted_records = sum(adopted == 1),
+    adoption_rate = mean(adopted),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sex = str_to_title(sex),
+    label = percent(adoption_rate, accuracy = 0.1)
+  ) %>%
+  arrange(adoption_rate)
+
+adoption_by_sex_status_plot <- ggplot(
+  adoption_by_sex_status,
+  aes(x = adoption_rate, y = reorder(sex, adoption_rate))
+) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = label), hjust = -0.15, size = 3.5) +
+  scale_x_continuous(
+    labels = percent,
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title = "Observed adoption rate by recorded sex/status",
+    x = "Observed adoption rate",
+    y = "Recorded sex/status"
+  )
+
+adoption_by_sex_status_plot
+
+ggsave(
+  filename = file.path(figures_dir, "observed_adoption_rate_by_sex_status.png"),
+  plot = adoption_by_sex_status_plot,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+```
+
+Observed adoption rates differ strongly by recorded sex/status. Records marked as spayed or neutered have adoption rates around 50%, while records marked only as female or male have adoption rates around 10%. Records with unknown sex/status have the lowest observed adoption rate at 0.6%. This variable should be interpreted carefully because it combines biological sex with sterilisation status and may partly reflect shelter processing before adoption.\
+
+## Bayesian Model Specification
+
+The response variable is binary, where $Y_i = 1$ indicates that shelter record $i$ resulted in adoption and $Y_i = 0$ indicates another observed shelter outcome. A Bayesian logistic regression model is used because the outcome is binary and the goal is to estimate how animal and intake characteristics are associated with adoption probability.
+
+For each shelter record $i$:
+
+$$
+Y_i \sim \text{Bernoulli}(p_i)
+$$
+
+$$
+\operatorname{logit}(p_i) = \mathbf{x}_i^\top \boldsymbol{\beta}
+$$
+
+where $p_i$ is the probability of adoption and $\mathbf{x}_i$ contains the predictors for animal type, recorded sex/status, intake condition, intake type, and scaled age at intake.
+
+Weakly informative normal priors are assigned to the regression coefficients:
+
+$$
+\beta_j \sim \text{Normal}(0, 10^2)
+$$
+
+These priors are centred at zero, representing no strong prior assumption about the direction of each association. The prior standard deviation of 10 is broad on the log-odds scale, allowing the data to dominate while still keeping the Bayesian model formally specified.\
+
+## Modelling Data Preparation
+
+Categorical predictors are converted to factors before constructing the logistic regression design matrix. Reference categories are selected to make coefficient interpretation clear: cats, female records, normal intake condition, and stray intake type are used as baseline groups. Age at intake is standardised so that its coefficient represents the effect of a one-standard-deviation increase in age.
+
+```{r}
+#| label: modelling-data-preparation
+
+model_data <- model_data %>%
+  mutate(
+    animal_type = factor(animal_type),
+    sex = factor(sex),
+    intake_condition = factor(intake_condition),
+    intake_type = factor(intake_type),
+    age_scaled = as.numeric(scale(age_years))
+  ) %>%
+  mutate(
+    animal_type = relevel(animal_type, ref = "cat"),
+    sex = relevel(sex, ref = "Female"),
+    intake_condition = relevel(intake_condition, ref = "normal"),
+    intake_type = relevel(intake_type, ref = "stray")
+  )
+
+set.seed(8150)
+
+model_data_mcmc <- model_data %>%
+  group_by(adopted) %>%
+  slice_sample(prop = 0.30) %>%
+  ungroup()
+
+X <- model.matrix(
+  adopted ~ animal_type + sex + intake_condition + intake_type + age_scaled,
+  data = model_data_mcmc
+)
+
+Y <- model_data_mcmc$adopted
+
+jags_data <- list(
+  Y = Y,
+  X = X,
+  N = nrow(X),
+  P = ncol(X)
+)
+
+write_csv(model_data_mcmc, file.path(data_processed_dir, "model_data_mcmc_sample.csv"))
+
+model_matrix_summary <- tibble(
+  Metric = c(
+    "MCMC modelling records",
+    "Adopted records in MCMC sample",
+    "Non-adoption records in MCMC sample",
+    "Number of model predictors including intercept"
+  ),
+  Value = c(
+    comma(nrow(model_data_mcmc)),
+    comma(sum(Y == 1)),
+    comma(sum(Y == 0)),
+    comma(ncol(X))
+  )
+)
+
+kable(model_matrix_summary, caption = "Summary of modelling sample and design matrix")
+```
+
+The Bayesian model is fitted on a reproducible stratified sample of the cleaned modelling dataset. Stratified sampling preserves the adoption/non-adoption balance while reducing JAGS runtime, making the workflow easier to reproduce during report generation.
+
+## Bayesian Model Fitting with JAGS
+
+The Bayesian logistic regression model was fitted using JAGS. The model uses a Bernoulli likelihood with a logit link and weakly informative normal priors for all regression coefficients.
+
+``` jags
+model {
+  for (i in 1:N) {
+    Y[i] ~ dbern(p[i])
+    logit(p[i]) <- inprod(X[i, ], beta[])
+  }
+
+  for (j in 1:P) {
+    beta[j] ~ dnorm(0, 0.01)
+  }
+}
+```
+
+```{r}
+#| label: define-jags-model
+
+logistic_model <- "
+model {
+  for (i in 1:N) {
+    Y[i] ~ dbern(p[i])
+    logit(p[i]) <- inprod(X[i, ], beta[])
+  }
+
+  for (j in 1:P) {
+    beta[j] ~ dnorm(0, 0.01)
+  }
+}
+"
+
+params <- c("beta")
+
+posterior_samples_path <- file.path(model_dir, "posterior_samples_final.rds")
+```
+
+```{r}
+#| label: fit-jags-model
+
+if (file.exists(posterior_samples_path)) {
+
+  posterior_samples <- readRDS(posterior_samples_path)
+
+} else {
+
+  inits <- list(
+    list(.RNG.name = "base::Wichmann-Hill", .RNG.seed = 8151),
+    list(.RNG.name = "base::Wichmann-Hill", .RNG.seed = 8152)
+  )
+
+  jags_model <- jags.model(
+    textConnection(logistic_model),
+    data = jags_data,
+    inits = inits,
+    n.chains = 2,
+    n.adapt = 1000
+  )
+
+  update(jags_model, 3000)
+
+  posterior_samples <- coda.samples(
+    model = jags_model,
+    variable.names = params,
+    n.iter = 8000,
+    thin = 2
+  )
+
+  saveRDS(posterior_samples, posterior_samples_path)
+}
+```
+
+## Posterior Summary and MCMC Diagnostics
+
+Posterior convergence was assessed using Gelman-Rubin $\hat{R}$ values, effective sample sizes, and visual inspection of selected MCMC trace plots.
+
+```{r}
+#| label: mcmc-diagnostics-summary
+
+posterior_matrix <- as.matrix(posterior_samples)
+
+rhat_values <- gelman.diag(
+  posterior_samples,
+  autoburnin = FALSE
+)$psrf[, "Point est."]
+
+ess_values <- effectiveSize(posterior_samples)
+
+diagnostics_summary <- tibble(
+  Metric = c(
+    "Number of MCMC chains",
+    "Total retained posterior draws",
+    "Maximum Rhat",
+    "Minimum effective sample size"
+  ),
+  Value = c(
+    length(posterior_samples),
+    comma(nrow(posterior_matrix)),
+    round(max(rhat_values), 3),
+    comma(round(min(ess_values), 1))
+  )
+)
+
+write_csv(diagnostics_summary, file.path(tables_dir, "mcmc_diagnostics_summary.csv"))
+
+kable(
+  diagnostics_summary,
+  caption = "MCMC convergence diagnostics for the Bayesian logistic regression model"
+)
+```
+
+The convergence diagnostics suggest that the MCMC sampling was acceptable for this analysis. The maximum $\hat{R}$ value was 1.001, which is very close to 1 and indicates good agreement between chains. The minimum effective sample size was 670, suggesting that the retained posterior draws provide enough independent information for stable posterior summaries. Trace plots are examined next as a visual diagnostic.
