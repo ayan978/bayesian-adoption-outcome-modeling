@@ -1,5 +1,5 @@
 ---
-title: "Bayesian Logistic Regression for Animal Shelter Adoption Outcomes"
+title: "Bayesian Analysis of Animal Shelter Adoption Outcomes"
 subtitle: "A Bayesian analysis of Long Beach Animal Shelter intake and outcome records"
 author: "Sadiqun Nur Ayan"
 format:
